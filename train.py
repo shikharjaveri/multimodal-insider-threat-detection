@@ -3,95 +3,124 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
 
-# Model
-class Autoencoder(nn.Module):
-    def __init__(self, input_dim):
+# Dataset 
+class UserAwareSequenceDataset(Dataset):
+    def __init__(self, df, feature_cols, target_col, seq_len):
+        self.sequences = []
+        self.labels = []
+        
+        # Grouped by user to ensure sequences are logically connected
+        for user, group in df.groupby("user"):
+            features = group[feature_cols].values.astype(np.float32)
+            targets = group[target_col].values.astype(np.float32)
+            
+            # Only created sequences if user had enough days of data
+            if len(features) > seq_len:
+                # Used sliding window logic
+                for i in range(len(features) - seq_len):
+                    self.sequences.append(features[i : i + seq_len])
+                    self.labels.append(targets[i + seq_len])
+                    
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.sequences[idx]), torch.tensor(self.labels[idx])
+
+# Large LSTM Model
+class LargeLSTMClassifier(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, num_layers=1, dropout=0.3):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 16),
-            nn.ReLU(),
-            nn.Linear(16, 8),
-            nn.ReLU()
+        # Architecture from experiments.ipynb
+        self.lstm = nn.LSTM(
+            input_dim, 
+            hidden_dim, 
+            num_layers=num_layers, 
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(8, 16),
-            nn.ReLU(),
-            nn.Linear(16, input_dim)
-        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
-        return self.decoder(self.encoder(x))
+        out, _ = self.lstm(x)
+        # Taking the last time step
+        last_step = out[:, -1, :]
+        logits = self.fc(self.dropout(last_step))
+        return logits 
 
-
-# Train
+# Training Logic
 def main(args):
+    # Load and Sort Data
     df = pd.read_csv(args.data)
+    df['day'] = pd.to_datetime(df['day'])
+    df = df.sort_values(['user', 'day']) 
 
-    X = df.select_dtypes(include=[np.number]).drop(columns=["suspicious"], errors="ignore")
+    # Feature Selection
+    feature_cols = ['logins', 'off_hour_logins', 'file_ops', 'usb_events', 'http_uploads', 'emails_sent']
+    target_col = "suspicious"
 
-    if X.shape[1] == 0:
-        raise ValueError("No numeric feature columns found.")
-
+    # Scaling
     scaler = MinMaxScaler()
-    X_scaled = scaler.fit_transform(X)
+    df[feature_cols] = scaler.fit_transform(df[feature_cols])
 
-    X_train, X_val = train_test_split(X_scaled, test_size=0.2, random_state=136)
+    # Create User-Aware Sequences
+    print(f"Generating sequences (Length: {args.seq_len})...")
+    dataset = UserAwareSequenceDataset(df, feature_cols, target_col, args.seq_len)
+    
+    # Split (80/20)
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32))
-    val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float32))
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
-
-    model = Autoencoder(X_train.shape[1])
+    # Initialize Model & Weighted Loss
+    model = LargeLSTMClassifier(len(feature_cols), hidden_dim=128, dropout=0.3)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
+    
+    # Using pos_weight=21 because suspicious cases are rare (~4.4%)
+    pos_weight = torch.tensor([21.0])
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+    print("Starting training")
     best_loss = float("inf")
-
     for epoch in range(args.epochs):
         model.train()
-        train_loss = 0
-        for (x,) in train_loader:
+        t_loss = 0
+        for xb, yb in train_loader:
             optimizer.zero_grad()
-            recon = model(x)
-            loss = criterion(recon, x)
+            logits = model(xb).squeeze()
+            loss = criterion(logits, yb)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
-
-        train_loss /= len(train_loader)
+            t_loss += loss.item()
 
         model.eval()
-        val_loss = 0
+        v_loss = 0
         with torch.no_grad():
-            for (x,) in val_loader:
-                recon = model(x)
-                loss = criterion(recon, x)
-                val_loss += loss.item()
-        val_loss /= len(val_loader)
+            for xb, yb in val_loader:
+                v_loss += criterion(model(xb).squeeze(), yb).item()
 
-        print(f"Epoch {epoch+1}/{args.epochs} - Train: {train_loss:.6f} Val: {val_loss:.6f}")
+        print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {t_loss/len(train_loader):.4f} | Val Loss: {v_loss/len(val_loader):.4f}")
 
-        if val_loss < best_loss:
-            best_loss = val_loss
+        if (v_loss/len(val_loader)) < best_loss:
+            best_loss = v_loss/len(val_loader)
             torch.save(model.state_dict(), args.model_out)
-            np.save(args.scaler_out, scaler.scale_)
-            np.save(args.min_out, scaler.min_)
-
-    print("Training complete")
+            np.save("scaler_scale.npy", scaler.scale_)
+            np.save("scaler_min.npy", scaler.min_)
 
 
-#    parser = argparse.ArgumentParser()
-#    parser.add_argument("data", default="behavioral_features.csv")
-#    parser.add_argument("epochs", type=int, default=50)
-#    parser.add_argument("batch_size", type=int, default=128)
-#    parser.add_argument("lr", type=float, default=1e-3)
-#    parser.add_argument("model_out", default="autoencoder.pt")
-#    parser.add_argument("scaler_out", default="scaler_scale.npy")
-#    parser.add_argument("min_out", default="scaler_min.npy")
-#    args = parser.parse_args()
+   # parser = argparse.ArgumentParser()
+   # parser.add_argument("data", default="behavioral_features.csv")
+   # parser.add_argument("epochs", type=int, default=5)
+   # parser.add_argument("batch_size", type=int, default=2048) 
+   # parser.add_argument("lr", type=float, default=0.001)      
+   # parser.add_argument("seq_len", type=int, default=7)       
+   # parser.add_argument("model_out", default="large_lstm_classifier.pt")
+   # args = parser.parse_args()
+   
